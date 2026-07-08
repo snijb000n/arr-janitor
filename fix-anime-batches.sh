@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # One-shot fix voor de 4 anime-batches die vastzitten in Sonarr queue.
-# Zie /root/.claude/plans/look-at-the-activity-spicy-scroll.md (Part B).
 #
-# Run als laominecon:
-#   bash /home/laominecon/scripts/arr-janitor/fix-anime-batches.sh
+# Run:
+#   bash /pad/naar/arr-janitor/fix-anime-batches.sh
 #
 # Wat dit script doet:
 #  1. Zet seriesType=anime op WIND BREAKER (36), 7th Prince/Tensei (40), Haikyu (33).
@@ -13,8 +12,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
 # Config laden
-. /home/laominecon/scripts/arr-janitor/config.env
+. "$SCRIPT_DIR/config.env"
 KEY="$SONARR_API_KEY"
 URL="$SONARR_URL"
 
@@ -41,7 +42,7 @@ done
 
 echo ''
 echo '=== Stap 2: Tokyo Revengers BD batch hernoemen ==='
-TR_DIR="/home/laominecon/compose/complete/downloads/completed/tv/[Anime Time] Tokyo Revengers  (Season 2) [BD] [Uncensored] [Dual Audio] [1080p][HEVC 10bit x265][AAC][Eng Sub] [Batch]"
+TR_DIR="$SONARR_DOWNLOADS_HOST/[Anime Time] Tokyo Revengers  (Season 2) [BD] [Uncensored] [Dual Audio] [1080p][HEVC 10bit x265][AAC][Eng Sub] [Batch]"
 if [ -d "$TR_DIR" ]; then
   cd "$TR_DIR"
   shopt -s nullglob
@@ -64,7 +65,7 @@ fi
 echo ''
 echo '=== Stap 3: arr-janitor import draaien ==='
 sleep 5   # geef Sonarr even om de refresh af te ronden
-python3 /home/laominecon/scripts/arr-janitor/arr_janitor.py import --verbose
+python3 "$SCRIPT_DIR/arr_janitor.py" import --verbose
 
 echo ''
 echo '=== Klaar. Run "clean --verbose" zo om eventuele zombies op te ruimen. ==='

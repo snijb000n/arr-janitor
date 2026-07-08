@@ -30,7 +30,7 @@ import requests
 
 import anime_common as ac
 
-STATE_PATH = Path("/home/sven/scripts/arr-janitor/anime_audio_state.json")
+STATE_PATH = Path(__file__).resolve().parent / "anime_audio_state.json"
 MAX_CHANGES = int(os.getenv("ANIME_AUDIO_MAX_PER_RUN", "1000"))
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v"}
 
@@ -302,7 +302,7 @@ def main() -> int:
         _telegram(args.dry_run, c, sorted(changed_titles), log)
     except Exception:  # noqa: BLE001
         log.exception("onverwachte fout")
-        ac.send_telegram("<b>TheBeastServer</b>\n<b>anime-audio — FOUT</b>\nZie log.", log)
+        ac.send_telegram(f"<b>{ac.HOST_LABEL}</b>\n<b>anime-audio — FOUT</b>\nZie log.", log)
         rc = 1
     finally:
         if not args.dry_run:
@@ -319,12 +319,12 @@ def _telegram(dry_run, c, titles, log):
     n = c["would_change"] if dry_run else c["changed"]
     if not n:
         ac.send_telegram(
-            f"<b>TheBeastServer</b>\n<b>anime-audio{mode}</b>\n\n"
+            f"<b>{ac.HOST_LABEL}</b>\n<b>anime-audio{mode}</b>\n\n"
             f"Niets te wijzigen ({c['already_ok']} al goed, {c['no_lang_track']} zonder "
             f"originele audio, {c['unmatched']} niet in *arr).", log)
         return
     verb = "zou fixen" if dry_run else "gefixt"
-    msg = [f"<b>TheBeastServer</b>", f"<b>anime-audio{mode}</b>", "",
+    msg = [f"<b>{ac.HOST_LABEL}</b>", f"<b>anime-audio{mode}</b>", "",
            f"<b>{n} bestand(en) {verb}</b> over {len(titles)} titel(s):"]
     msg += [f"  • {t}" for t in titles[:15]]
     if len(titles) > 15:

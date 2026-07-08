@@ -27,11 +27,15 @@ archieven uit. Eén Python-script, geen extra dependencies behalve `requests`.
 ## Eerste gebruik
 
 ```bash
-cd /home/laominecon/scripts/arr-janitor
-# 1. Lees-test (geen mutaties)
+cd /pad/naar/arr-janitor   # bijv. ~/scripts/arr-janitor
+# 1. Machine-setup: genereert machine.env + config.env, print cron-regels
+./setup.sh
+# 2. Vul de API-keys in config.env in, daarna:
+
+# 3. Lees-test (geen mutaties)
 python3 arr_janitor.py all --dry-run --verbose
 
-# 2. Subcommando's los testen, eerst dry-run, dan echt
+# 4. Subcommando's los testen, eerst dry-run, dan echt
 python3 arr_janitor.py extract --dry-run
 python3 arr_janitor.py import --dry-run --verbose
 python3 arr_janitor.py clean  --dry-run --verbose
@@ -39,10 +43,11 @@ python3 arr_janitor.py clean  --dry-run --verbose
 
 ## Cron (5x per nacht)
 
-Als user `laominecon`:
+Als de user die de media beheert (op deze server: root). `./setup.sh` print
+deze regels met de juiste paden ingevuld.
 
 ```cron
-0 22,0,2,4,6 * * * /usr/bin/python3 /home/laominecon/scripts/arr-janitor/arr_janitor.py all >> /home/laominecon/scripts/arr-janitor/cron.log 2>&1
+0 22,0,2,4,6 * * * /usr/bin/python3 /pad/naar/arr-janitor/arr_janitor.py all >> /pad/naar/arr-janitor/cron.log 2>&1
 ```
 
 Runs: 22:00, 00:00, 02:00, 04:00, 06:00.
@@ -50,13 +55,13 @@ Runs: 22:00, 00:00, 02:00, 04:00, 06:00.
 Plus de anime-reclassify, dagelijks 05:00 (eigen lock, los van `all`):
 
 ```cron
-0 5 * * * /usr/bin/python3 /home/laominecon/scripts/arr-janitor/arr_janitor.py anime >> /home/laominecon/scripts_logs/arr_janitor_cron.log 2>&1
+0 5 * * * /usr/bin/python3 /pad/naar/arr-janitor/arr_janitor.py anime >> /pad/naar/arr-janitor/cron.log 2>&1
 ```
 
 Plus de plex audio-language, dagelijks 05:30 (na de anime-reclassify, eigen lock):
 
 ```cron
-30 5 * * * /usr/bin/python3 /home/laominecon/scripts/arr-janitor/arr_janitor.py plexlang >> /home/laominecon/scripts_logs/arr_janitor_cron.log 2>&1
+30 5 * * * /usr/bin/python3 /pad/naar/arr-janitor/arr_janitor.py plexlang >> /pad/naar/arr-janitor/cron.log 2>&1
 ```
 
 ### anime-detectie
@@ -120,6 +125,17 @@ Belangrijkste schakelaar:
 - `IMPORT_MODE=Copy` — origineel blijft staan na import (veilig, rollback mogelijk).
 - Na ~2 weken zonder problemen → `IMPORT_MODE=Move` zodat `completed/` wordt opgeruimd.
 
+## Machine-configuratie (`machine.env`)
+
+Naast `config.env` (arr-janitor API-keys + drempels) is er `machine.env`:
+machinepaden voor de anime-scripts (`anime_sort.py`, `anime_audio.py`).
+Gegenereerd door `./setup.sh`, gitignored. Keys: `SECRETS_FILE` (fleet-brede
+secrets), `LOG_DIR`, `MEDIA_ROOT` (+ optionele per-map overrides, zie
+`machine.env.example`) en `HOST_LABEL` (machinenaam in Telegram-berichten,
+default de hostname). Geen `machine.env` → de defaults in `anime_common.py`
+(= de waarden van TheBeastServer). Echte env-vars winnen altijd van beide
+bestanden.
+
 ## Logging
 
 - `arr_janitor.log` — rotating, 5 MB × 5. Eén regel per actie.
@@ -145,14 +161,16 @@ zonder cron-gymnastiek.
 `config.env` bestaat niet. Het script zoekt `config.env` naast zichzelf.
 
 **"manualimport GET failed: 401"** — verkeerde API-key. Pak hem opnieuw uit
-`/home/laominecon/compose/{radarr,sonarr}/data/config.xml` (`<ApiKey>`).
+de `config.xml` in de data-map van je Radarr/Sonarr-container (op deze server:
+`/home/sven/docker/{radarr,sonarr}/data/config.xml`, `<ApiKey>`).
 
 **Imports doen niets** — check `arr_janitor.log` op `WARNING import[xxx]: skip`.
 Toont rejections. Vaakste oorzaken: film/serie nog niet aan Radarr/Sonarr
 toegevoegd, of file-naam niet matchbaar. Voeg de film/serie eerst toe of hernoem
 de file zodat de parser het oppikt.
 
-**Cron draait niet** — `crontab -l -u laominecon` checken; `journalctl -u cron --since "1 hour ago"`.
+**Cron draait niet** — `crontab -l` checken (of `sudo crontab -l` als de cron
+onder root draait); `journalctl -u cron --since "1 hour ago"`.
 
 ## Wat dit script niet doet
 

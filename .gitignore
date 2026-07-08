@@ -1,5 +1,6 @@
 # Secrets / config
 config.env
+machine.env
 
 # Logs (incl. rotated: arr_janitor.log.1 etc.)
 *.log

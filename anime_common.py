@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Gedeelde helpers voor de anime-scripts (anime_sort.py, anime_audio.py).
 
-Config uit /home/sven/scripts/secrets/config.env (zelfde bron als de rest van de
-media-fleet). Bevat: HTTP-sessie met retry, Radarr/Sonarr/Emby-clients, Telegram,
-fcntl-lockfile, logging, container<->host padmapping en taalnaam->ISO-639 mapping.
+Config uit SECRETS_FILE (default de fleet-secrets, zelfde bron als de rest van
+de media-fleet); machine-specifieke paden via machine.env naast dit script
+(gegenereerd door setup.sh, gitignored). Bevat: HTTP-sessie met retry,
+Radarr/Sonarr/Emby-clients, Telegram, fcntl-lockfile, logging,
+container<->host padmapping en taalnaam->ISO-639 mapping.
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import fcntl
 import logging
 import logging.handlers
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -23,8 +26,17 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("FATAL: python-dotenv ontbreekt")
 
-SECRETS_PATH = "/home/sven/scripts/secrets/config.env"
-LOG_DIR = Path("/home/sven/scripts/logs")
+# Machine-specifieke instellingen. Defaults = TheBeastServer; override per
+# machine via machine.env (gitignored, gegenereerd door setup.sh) of gewone
+# env-vars. Volgorde is bewust: machine.env EERST, daarna pas de secrets —
+# load_dotenv overschrijft reeds gezette env-vars niet, dus machine.env wint
+# van de secrets-file en echte env-vars (cron) winnen van alles.
+SCRIPT_DIR = Path(__file__).resolve().parent
+load_dotenv(SCRIPT_DIR / "machine.env")
+
+SECRETS_PATH = os.getenv("SECRETS_FILE", "/home/sven/scripts/secrets/config.env")
+LOG_DIR = Path(os.getenv("LOG_DIR", "/home/sven/scripts/logs"))
+HOST_LABEL = os.getenv("HOST_LABEL", socket.gethostname())
 
 load_dotenv(SECRETS_PATH)
 
@@ -44,20 +56,30 @@ ANIME_LANGS = {
     if s.strip()
 }
 
+# Basis van de host-mediamappen; per map overridebaar via env (machine.env).
+MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", "/home/sven/media"))
+
+
+def _media_dir(env_key: str, default_subdir: str) -> Path:
+    """Host-mediamap: MEDIA_ROOT/<subdir>, individueel overridebaar via env."""
+    return Path(os.getenv(env_key, str(MEDIA_ROOT / default_subdir)))
+
+
 # Container-root (zoals *arr het pad rapporteert) -> host-pad. Let op de casing:
-# container is lowercase, host-map is met hoofdletters.
+# container is lowercase, host-map is met hoofdletters. De container-keys zijn
+# vast (bepaald door de *arr container-mounts).
 RADARR_ROOT_HOST = {
-    "/movies": Path("/home/sven/media/movies"),
-    "/nl-movies": Path("/home/sven/media/NL-movies"),
-    "/anime-movies": Path("/home/sven/media/Anime-movies"),
+    "/movies": _media_dir("MOVIES_DIR", "movies"),
+    "/nl-movies": _media_dir("NL_MOVIES_DIR", "NL-movies"),
+    "/anime-movies": _media_dir("ANIME_MOVIES_DIR", "Anime-movies"),
 }
 SONARR_ROOT_HOST = {
-    "/tv": Path("/home/sven/media/tv"),
-    "/nl-tv": Path("/home/sven/media/NL-tv"),
-    "/anime-tv": Path("/home/sven/media/Anime-tv"),
+    "/tv": _media_dir("TV_DIR", "tv"),
+    "/nl-tv": _media_dir("NL_TV_DIR", "NL-tv"),
+    "/anime-tv": _media_dir("ANIME_TV_DIR", "Anime-tv"),
 }
-ANIME_MOVIES_HOST = Path("/home/sven/media/Anime-movies")
-ANIME_TV_HOST = Path("/home/sven/media/Anime-tv")
+ANIME_MOVIES_HOST = RADARR_ROOT_HOST["/anime-movies"]
+ANIME_TV_HOST = SONARR_ROOT_HOST["/anime-tv"]
 
 # TVDB/TMDB taalnaam -> set ISO-639 codes zoals ffprobe ze in tags.language zet.
 LANG_CODES: dict[str, set[str]] = {

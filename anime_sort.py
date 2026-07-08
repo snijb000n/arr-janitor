@@ -145,9 +145,9 @@ def _telegram(dry_run, mv_names, sr_names, conflicts, log):
     verb = "zou verplaatsen" if dry_run else "verplaatst"
     if not mv_names and not sr_names and not conflicts:
         ac.send_telegram(
-            f"<b>TheBeastServer</b>\n<b>anime-sort{mode}</b>\n\nNiets te verplaatsen.", log)
+            f"<b>{ac.HOST_LABEL}</b>\n<b>anime-sort{mode}</b>\n\nNiets te verplaatsen.", log)
         return
-    msg = ["<b>TheBeastServer</b>", f"<b>anime-sort{mode}</b>", ""]
+    msg = [f"<b>{ac.HOST_LABEL}</b>", f"<b>anime-sort{mode}</b>", ""]
     if mv_names:
         msg.append(f"<b>Films {verb} ({len(mv_names)}):</b>")
         msg += [f"  • {n}" for n in mv_names[:15]]
@@ -235,7 +235,7 @@ def main() -> int:
         return 0
     except Exception:  # noqa: BLE001
         log.exception("onverwachte fout")
-        ac.send_telegram("<b>TheBeastServer</b>\n<b>anime-sort — FOUT</b>\nZie log.", log)
+        ac.send_telegram(f"<b>{ac.HOST_LABEL}</b>\n<b>anime-sort — FOUT</b>\nZie log.", log)
         return 1
     finally:
         ac.release_lock(lock)
