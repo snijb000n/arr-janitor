@@ -255,7 +255,8 @@ def update_bucket(bucket, detected_keys, replaced, label):
                 log.warning(f'  {label} {key}: na eerdere vervanging opnieuw DV -> geparkeerd '
                             f'(handmatige aandacht nodig)')
             else:
-                bucket[key] = {'first_seen': _now(), 'nights': 0, 'status': 'active'}
+                status = 'parked' if DV_ACTIVE_NIGHTS <= 0 else 'active'
+                bucket[key] = {'first_seen': _now(), 'nights': 0, 'status': status}
         elif entry.get('status') == 'active':
             entry['nights'] = entry.get('nights', 0) + 1
             if entry['nights'] >= DV_ACTIVE_NIGHTS:
