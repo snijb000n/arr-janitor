@@ -7,6 +7,9 @@ Subcommando's:
   import    push manualimport-kandidaten met zekere match door
   clean     verwijder stalled/failed queue-items + blocklist + optionele re-search
   all       extract -> import -> clean (cron-entry)
+  anime     detecteer anime-series en zet seriesType/root/profiel (eigen cron)
+  plexlang  zet in Plex de default audiotrack op de originele taal, alleen voor
+            anime (eigen cron)
 
 Globale flags: --dry-run, --verbose
 Config: ./config.env naast dit script.
@@ -36,7 +39,29 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.env"
 LOG_PATH = SCRIPT_DIR / "arr_janitor.log"
 LOCK_PATH = SCRIPT_DIR / ".lock"
+ANIME_LOCK_PATH = SCRIPT_DIR / ".lock-anime"
+PLEX_LOCK_PATH = SCRIPT_DIR / ".lock-plex"
 EXTRACT_MARKER_SUFFIX = ".extracted"
+TMDB_API_BASE = "https://api.themoviedb.org/3"
+TMDB_ANIME_KEYWORD_ID = 210024  # TMDb keyword "anime"
+TMDB_ANIMATION_GENRE_ID = 16    # TMDb genre "Animation"
+# TMDb original_language (ISO-639-1) -> acceptabele Plex audio languageCodes
+# (ISO-639-2). Plex gebruikt soms 'zho' en soms 'chi' voor Chinees.
+ISO6391_TO_PLEX_LANG = {
+    "ja": {"jpn"},
+    "ko": {"kor"},
+    "zh": {"zho", "chi", "cmn", "yue"},
+}
+# Een Plex-code -> alle codes die als dezelfde taal gelden (zho==chi==cmn==yue).
+PLEX_LANG_EQUIV: dict[str, frozenset[str]] = {}
+for _codes in ISO6391_TO_PLEX_LANG.values():
+    for _c in _codes:
+        PLEX_LANG_EQUIV[_c] = frozenset(_codes)
+# Fallback wanneer een stream geen languageCode heeft, alleen een naam.
+PLEX_LANGNAME_TO_CODE = {
+    "japanese": "jpn", "korean": "kor", "chinese": "zho",
+    "mandarin": "cmn", "cantonese": "yue",
+}
 ARCHIVE_EXTS = {".rar", ".zip", ".7z"}
 STALLED_PATTERNS = re.compile(
     r"stalled|no files found|corrupt|truncated|incomplete|aborted|unable to import",
@@ -74,6 +99,21 @@ class Config:
     import_mode: str
     fuzzy_match_enabled: bool
     fuzzy_match_threshold: float
+    zombie_cleanup_enabled: bool
+    max_zombie_remove_per_run: int
+    tmdb_api_key: str
+    anime_root_folder: str
+    anime_quality_profile: str
+    anime_detection: str
+    anime_move_files: bool
+    anime_refresh_after: bool
+    max_anime_reclassify_per_run: int
+    anime_exclude_ids: frozenset[int]
+    plex_url: str
+    plex_token: str
+    plex_anime_sections: tuple[str, ...]
+    plex_audio_fallback: tuple[str, ...]
+    max_plex_audio_parts_per_run: int
 
     def all_roots(self) -> list[Path]:
         return [self.radarr.downloads_host, self.sonarr.downloads_host]
@@ -146,6 +186,24 @@ def load_config() -> Config:
         fuzzy_threshold = float(e.get("FUZZY_MATCH_THRESHOLD", "0.75"))
     except ValueError:
         fuzzy_threshold = 0.75
+
+    anime_detection = e.get("ANIME_DETECTION", "both").strip().lower()
+    if anime_detection not in ("both", "tvdb", "tmdb"):
+        sys.exit(f"FATAL: ANIME_DETECTION must be both|tvdb|tmdb, got {anime_detection!r}")
+    exclude_ids: set[int] = set()
+    for tok in (e.get("ANIME_EXCLUDE_IDS", "") or "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if tok:
+            try:
+                exclude_ids.add(int(tok))
+            except ValueError:
+                log.warning("config: ignoring non-int ANIME_EXCLUDE_IDS value %r", tok)
+
+    def as_tuple(k: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        raw = (e.get(k, "") or "").replace(";", ",")
+        vals = tuple(t.strip() for t in raw.split(",") if t.strip())
+        return vals if vals else default
+
     return Config(
         radarr=radarr,
         sonarr=sonarr,
@@ -157,6 +215,21 @@ def load_config() -> Config:
         import_mode=import_mode,
         fuzzy_match_enabled=as_bool("FUZZY_MATCH_ENABLED", True),
         fuzzy_match_threshold=fuzzy_threshold,
+        zombie_cleanup_enabled=as_bool("ZOMBIE_CLEANUP_ENABLED", True),
+        max_zombie_remove_per_run=as_int("MAX_ZOMBIE_REMOVE_PER_RUN", 100),
+        tmdb_api_key=e.get("TMDB_API_KEY", "").strip(),
+        anime_root_folder=e.get("ANIME_ROOT_FOLDER", "/anime-tv").strip().rstrip("/"),
+        anime_quality_profile=e.get("ANIME_QUALITY_PROFILE", "Ultra-HD - Anime").strip(),
+        anime_detection=anime_detection,
+        anime_move_files=as_bool("ANIME_MOVE_FILES", True),
+        anime_refresh_after=as_bool("ANIME_REFRESH_AFTER", True),
+        max_anime_reclassify_per_run=as_int("MAX_ANIME_RECLASSIFY_PER_RUN", 25),
+        anime_exclude_ids=frozenset(exclude_ids),
+        plex_url=e.get("PLEX_URL", "").strip().rstrip("/"),
+        plex_token=e.get("PLEX_TOKEN", "").strip(),
+        plex_anime_sections=as_tuple("PLEX_ANIME_SECTIONS", ()),
+        plex_audio_fallback=as_tuple("PLEX_AUDIO_FALLBACK", ("jpn", "kor", "zho")),
+        max_plex_audio_parts_per_run=as_int("MAX_PLEX_AUDIO_PARTS_PER_RUN", 1000),
     )
 
 
@@ -179,8 +252,8 @@ class _LockHeld(Exception):
     pass
 
 
-def acquire_lock():
-    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+def acquire_lock(path: Path = LOCK_PATH):
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -222,6 +295,28 @@ def arr_post(s: requests.Session, inst: ArrInstance, path: str, body):
 def arr_delete(s: requests.Session, inst: ArrInstance, path: str, **params):
     headers = {"X-Api-Key": inst.api_key}
     r = s.delete(f"{inst.url}/api/v3{path}", headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
+def arr_put(s: requests.Session, inst: ArrInstance, path: str, body, **params):
+    headers = {"X-Api-Key": inst.api_key, "Content-Type": "application/json"}
+    r = s.put(f"{inst.url}/api/v3{path}", headers=headers, json=body,
+              params=params, timeout=60)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
+def plex_get(s: requests.Session, cfg: Config, path: str, **params):
+    headers = {"X-Plex-Token": cfg.plex_token, "Accept": "application/json"}
+    r = s.get(f"{cfg.plex_url}{path}", headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
+def plex_put(s: requests.Session, cfg: Config, path: str, **params):
+    headers = {"X-Plex-Token": cfg.plex_token, "Accept": "application/json"}
+    r = s.put(f"{cfg.plex_url}{path}", headers=headers, params=params, timeout=30)
     r.raise_for_status()
     return r.json() if r.content else {}
 
@@ -432,202 +527,89 @@ def _fuzzy_pick(name: str, candidates: list[tuple[int, str]],
     return (best_id if best_score >= threshold else None, best_score)
 
 
-# Rejections die we NOOIT mogen overrulen (kwaliteit/sample/pack-issues zijn
-# bewuste *arr-beslissingen, geen parser-mismatch).
-_BLOCKING_REJECTION = re.compile(
-    r"not an upgrade|not a custom format upgrade|sample|"
-    r"single episode file contains all episodes",
-    re.IGNORECASE,
-)
-# Rejections die wél recoverable zijn via fuzzy series-match en/of episode-resolve.
-_RECOVERABLE_REJECTION = re.compile(
-    r"unknown series|unknown movie|invalid season or episode|"
-    r"episode \d+x\d+ was unexpected",
-    re.IGNORECASE,
-)
-
-
-def _classify_rejections(rejections: list) -> tuple[bool, bool]:
-    """Return (has_recoverable, has_blocking).
-
-    Een item is alleen safe-to-recover als has_recoverable=True én has_blocking=False.
-    """
-    if not rejections:
-        return (False, False)
-    has_recoverable = False
-    has_blocking = False
-    for r in rejections:
+def _is_unknown_rejection(rejections: list) -> bool:
+    """True als rejection past bij 'Unknown Series/Movie' (parser-mismatch)."""
+    for r in rejections or []:
         reason = (r.get("reason") or "").lower() if isinstance(r, dict) else str(r).lower()
-        if _BLOCKING_REJECTION.search(reason):
-            has_blocking = True
-        if _RECOVERABLE_REJECTION.search(reason):
-            has_recoverable = True
-    return (has_recoverable, has_blocking)
-
-
-def _is_recoverable_rejection(rejections: list) -> bool:
-    """True als alle rejections recoverable zijn (geen blocking ones)."""
-    has_recoverable, has_blocking = _classify_rejections(rejections)
-    return has_recoverable and not has_blocking
-
-
-# Getallen die NOOIT een absoluut episode-nummer zijn (codecs, resoluties, jaren).
-_FALSE_EP_NUMBERS = {264, 265, 360, 480, 720, 1080, 1440, 2160, 4320}
-
-
-def _extract_absolute_candidates(filename: str) -> list[int]:
-    """Pak waarschijnlijke absoluut-episode-nummers uit filename.
-
-    Heuristieken (van strikt naar losser):
-      1. `Episode\s*N` → expliciet (zeer betrouwbaar)
-      2. `S\d+E(N)` waar N >= 100 → absoluut in E-slot (anime mis-tag)
-      3. ` - N ` of `]-N[` of `]N[` → anime release pattern
-    Filtert jaartallen (1900-2099), codecs en resoluties.
-    """
-    candidates: list[int] = []
-
-    def _add(n: int) -> None:
-        if n in _FALSE_EP_NUMBERS:
-            return
-        if 1900 <= n <= 2099:
-            return
-        if 1 <= n <= 9999 and n not in candidates:
-            candidates.append(n)
-
-    for m in re.finditer(r"\bEpisode[\s._-]*(\d{1,4})\b", filename, re.IGNORECASE):
-        _add(int(m.group(1)))
-    for m in re.finditer(r"\bS\d{1,2}E(\d{3,4})\b", filename, re.IGNORECASE):
-        _add(int(m.group(1)))
-    for m in re.finditer(r"(?:\s|\]|^)-?\s*(\d{1,4})(?=\s|\[|\(|\.|$)", filename):
-        n = int(m.group(1))
-        # bredere fallback: alleen accepteren als het géén SxxExx-context heeft
-        if not re.search(rf"S\d+E0*{n}\b", filename, re.IGNORECASE):
-            _add(n)
-    return candidates
+        if "unknown series" in reason or "unknown movie" in reason:
+            return True
+    return False
 
 
 def _resolve_episode_ids(inst: ArrInstance, s: requests.Session,
                          series_id: int, filename: str) -> list[int]:
-    """Resolve episode-ids voor `filename` binnen `series_id`.
-
-    Strategy 1: SxxExx parse + season/episode lookup (klassiek tv).
-    Strategy 2: absoluut episode-nummer lookup (anime / mis-tagged files).
-
-    Returns lege lijst bij ambiguïteit (>1 match) om verkeerde toewijzing te vermijden.
-    """
-    # Strategy 1: SxxExx
+    """Parse SxxExx uit filename en zoek bijbehorende episodeIds in Sonarr."""
     m = re.search(r"S(\d{1,2})E(\d{1,3})", filename, re.IGNORECASE)
-    if m:
-        season, ep_num = int(m.group(1)), int(m.group(2))
-        try:
-            eps = arr_get(s, inst, "/episode", seriesId=series_id, seasonNumber=season)
-            ids = [e["id"] for e in eps if e.get("episodeNumber") == ep_num]
-            if ids:
-                return ids
-        except requests.HTTPError as ex:
-            log.warning("resolve[%s]: episode lookup failed seriesId=%s s%s: %s",
-                        inst.name, series_id, season, ex)
-
-    # Strategy 2: absoluut episode-nummer
-    candidates = _extract_absolute_candidates(filename)
-    if not candidates:
+    if not m:
         return []
+    season, ep_num = int(m.group(1)), int(m.group(2))
     try:
-        all_eps = arr_get(s, inst, "/episode", seriesId=series_id)
+        eps = arr_get(s, inst, "/episode", seriesId=series_id, seasonNumber=season)
     except requests.HTTPError as ex:
-        log.warning("resolve[%s]: full episode fetch failed seriesId=%s: %s",
-                    inst.name, series_id, ex)
+        log.warning("fuzzy[%s]: episode lookup failed seriesId=%s s%s: %s",
+                    inst.name, series_id, season, ex)
         return []
-    abs_map: dict[int, list[int]] = {}
-    for e in all_eps:
-        a = e.get("absoluteEpisodeNumber")
-        if a:
-            abs_map.setdefault(a, []).append(e["id"])
-    # Pak eerste kandidaat die exact 1 episode oplevert
-    for n in candidates:
-        ids = abs_map.get(n)
-        if ids and len(ids) == 1:
-            log.debug("resolve[%s]: absolute %s -> episodeId %s :: %s",
-                      inst.name, n, ids[0], filename)
-            return ids
-    return []
+    return [e["id"] for e in eps if e.get("episodeNumber") == ep_num]
 
 
 def _try_fuzzy_match(inst: ArrInstance, s: requests.Session, cfg: Config,
                      skipped: list[dict]) -> list[dict]:
-    """Return extra import-payloads voor recoverable-rejection items.
-
-    Twee soorten recoverable:
-      A. 'Unknown Series/Movie' → series/movie onbekend, fuzzy-match nodig
-      B. 'Invalid season or episode' / 'Episode X was unexpected' →
-         series wél bekend (seriesId/movieId in item), alleen episode mismatch
-    """
+    """Return extra import-payloads voor items waar fuzzy-match werkt."""
     if not cfg.fuzzy_match_enabled or not skipped:
         return []
-    targets = [it for it in skipped if _is_recoverable_rejection(it.get("rejections"))]
+    # Filter alleen 'Unknown Series/Movie' rejections — andere rejections (upgrade,
+    # sample-detection) zijn bewust en niet door parser-mismatch te verklaren.
+    targets = [it for it in skipped if _is_unknown_rejection(it.get("rejections"))]
     if not targets:
         return []
 
-    # Pool alleen ophalen als minstens 1 target fuzzy-match nodig heeft.
-    needs_fuzzy = any(
-        not (it.get("seriesId") or (it.get("series") or {}).get("id")
-             or it.get("movieId") or (it.get("movie") or {}).get("id"))
-        for it in targets
-    )
+    # Pool van bestaande titles ophalen (1× per run).
     pool: list[tuple[int, str]] = []
-    if needs_fuzzy:
-        if inst.is_sonarr:
-            try:
-                for sr in arr_get(s, inst, "/series"):
-                    pool.append((sr["id"], sr.get("title", "")))
-                    for alt in sr.get("alternateTitles") or []:
-                        title = alt.get("title")
-                        if title:
-                            pool.append((sr["id"], title))
-            except requests.HTTPError as ex:
-                log.error("fuzzy[%s]: series pool fetch failed: %s", inst.name, ex)
-                return []
-        else:
-            try:
-                for mv in arr_get(s, inst, "/movie"):
-                    pool.append((mv["id"], mv.get("title", "")))
-                    for alt in mv.get("alternateTitles") or []:
-                        title = alt.get("title")
-                        if title:
-                            pool.append((mv["id"], title))
-            except requests.HTTPError as ex:
-                log.error("fuzzy[%s]: movie pool fetch failed: %s", inst.name, ex)
-                return []
+    if inst.is_sonarr:
+        try:
+            for sr in arr_get(s, inst, "/series"):
+                pool.append((sr["id"], sr.get("title", "")))
+                # alternateTitles vergroten match-kans
+                for alt in sr.get("alternateTitles") or []:
+                    title = alt.get("title")
+                    if title:
+                        pool.append((sr["id"], title))
+        except requests.HTTPError as ex:
+            log.error("fuzzy[%s]: series pool fetch failed: %s", inst.name, ex)
+            return []
+    else:
+        try:
+            for mv in arr_get(s, inst, "/movie"):
+                pool.append((mv["id"], mv.get("title", "")))
+                for alt in mv.get("alternateTitles") or []:
+                    title = alt.get("title")
+                    if title:
+                        pool.append((mv["id"], title))
+        except requests.HTTPError as ex:
+            log.error("fuzzy[%s]: movie pool fetch failed: %s", inst.name, ex)
+            return []
 
     payloads: list[dict] = []
     for it in targets:
         path = it.get("path") or ""
         fname = Path(path).stem
+        match_id, score = _fuzzy_pick(fname, pool, cfg.fuzzy_match_threshold)
+        if match_id is None:
+            log.info("fuzzy[%s]: no match (best score %.2f) :: %s",
+                     inst.name, score, fname)
+            continue
 
         if inst.is_sonarr:
-            # Bepaal seriesId — direct uit item als die er is, anders fuzzy.
-            sid = it.get("seriesId") or (it.get("series") or {}).get("id") or 0
-            if sid:
-                series_source = "direct"
-                score = 1.0
-            else:
-                sid, score = _fuzzy_pick(fname, pool, cfg.fuzzy_match_threshold)
-                series_source = "fuzzy"
-                if not sid:
-                    log.info("recover[sonarr]: no series match (best %.2f) :: %s",
-                             score, fname)
-                    continue
-
-            ep_ids = _resolve_episode_ids(inst, s, sid, fname)
+            ep_ids = _resolve_episode_ids(inst, s, match_id, fname)
             if not ep_ids:
-                log.info("recover[sonarr]: seriesId=%s (%s, score %.2f) maar episode niet resolvable :: %s",
-                         sid, series_source, score, fname)
+                log.info("fuzzy[%s]: matched seriesId=%s (score %.2f) maar episodeId niet resolvable :: %s",
+                         inst.name, match_id, score, fname)
                 continue
-            log.info("recover[sonarr]: seriesId=%s episodeIds=%s (%s, score %.2f) :: %s",
-                     sid, ep_ids, series_source, score, fname)
+            log.info("fuzzy[sonarr]: match seriesId=%s episodeIds=%s (score %.2f) :: %s",
+                     match_id, ep_ids, score, fname)
             payloads.append({
                 "path": path,
-                "seriesId": sid,
+                "seriesId": match_id,
                 "episodeIds": ep_ids,
                 "quality": it.get("quality"),
                 "languages": it.get("languages") or [{"id": 1, "name": "English"}],
@@ -635,22 +617,11 @@ def _try_fuzzy_match(inst: ArrInstance, s: requests.Session, cfg: Config,
                 "episodeFileId": 0,
             })
         else:
-            mid = it.get("movieId") or (it.get("movie") or {}).get("id") or 0
-            if mid:
-                movie_source = "direct"
-                score = 1.0
-            else:
-                mid, score = _fuzzy_pick(fname, pool, cfg.fuzzy_match_threshold)
-                movie_source = "fuzzy"
-                if not mid:
-                    log.info("recover[radarr]: no movie match (best %.2f) :: %s",
-                             score, fname)
-                    continue
-            log.info("recover[radarr]: movieId=%s (%s, score %.2f) :: %s",
-                     mid, movie_source, score, fname)
+            log.info("fuzzy[radarr]: match movieId=%s (score %.2f) :: %s",
+                     match_id, score, fname)
             payloads.append({
                 "path": path,
-                "movieId": mid,
+                "movieId": match_id,
                 "quality": it.get("quality"),
                 "languages": it.get("languages") or [],
                 "downloadId": it.get("downloadId"),
@@ -840,103 +811,88 @@ def _trigger_research(s, inst: ArrInstance, item: dict) -> None:
         log.warning("clean[%s]: re-search failed: %s", inst.name, ex)
 
 
-_PHANTOM_REJECTION = re.compile(
-    r"was unexpected considering the.*folder name|"
-    r"was not found in the grabbed release",
-    re.IGNORECASE,
-)
-
-
-def _cleanup_recover_phantoms(inst: ArrInstance, s: requests.Session,
-                              records: list[dict], dry_run: bool) -> set[int]:
-    """Detecteer en clean queue-rows die spook-restanten zijn van succesvolle
-    recover-imports (typisch: pack-grabs waar Sonarr's parser meer episodes
-    verwachtte dan de pack feitelijk bevatte).
-
-    Definitie phantom: row in importPending/importBlocked met rejection
-    "was unexpected" / "not found in the grabbed release", waarbij voor
-    dezelfde `downloadId` reeds een `downloadFolderImported` history-event
-    bestaat — de file is dus al onder een ander (echt) episodeId binnen,
-    de queue-row blijft hangen omdat Sonarr's parser de mismatch niet
-    zelf oplost. Cleanup zonder blocklist — geen re-grab risico, geen
-    file-actie (file blijft op disk).
-
-    Returns: set van qid's die zijn verwijderd (zodat caller die uit
-    stalled-detection kan filteren).
-    """
-    if not inst.is_sonarr:
-        return set()  # Radarr heeft geen episode-mismatch packs
-
-    candidates: list[dict] = []
-    for q in records:
-        state = (q.get("trackedDownloadState") or "").lower()
-        if state not in PENDING_TRACKED_STATES:
+def _zombie_rows_sonarr(rows: list[dict], episode_cache: dict[int, bool]) -> list[dict]:
+    out = []
+    for r in rows:
+        if (r.get("status") or "").lower() != "completed":
             continue
-        if not q.get("outputPath"):
+        if (r.get("trackedDownloadState") or "").lower() not in ("importblocked", "importpending"):
             continue
-        sms = q.get("statusMessages") or []
-        text = " ".join(
-            (m.get("title", "") or "") + " " + " ".join(m.get("messages") or [])
-            for m in sms
-        )
-        if not _PHANTOM_REJECTION.search(text):
+        ep_id = r.get("episodeId")
+        if ep_id and episode_cache.get(ep_id):
+            out.append(r)
+    return out
+
+
+def _zombie_rows_radarr(rows: list[dict], movie_has_file: dict[int, bool]) -> list[dict]:
+    out = []
+    for r in rows:
+        if (r.get("status") or "").lower() != "completed":
             continue
-        candidates.append(q)
+        if (r.get("trackedDownloadState") or "").lower() not in ("importblocked", "importpending"):
+            continue
+        mid = r.get("movieId")
+        if mid and movie_has_file.get(mid):
+            out.append(r)
+    return out
 
-    if not candidates:
-        return set()
 
-    # Sonarr history voor downloadFolderImported events (eventType=3).
-    # ManualImport events hebben downloadId=None maar wel data.droppedPath —
-    # daaruit halen we de pack-folder waar de file vandaan kwam.
-    try:
-        hist = arr_get(s, inst, "/history",
-                       pageSize=500, sortKey="date",
-                       sortDirection="descending", eventType=3)
-        hist_recs = hist.get("records", [])
-    except requests.HTTPError as ex:
-        log.warning("phantom[%s]: history fetch failed: %s", inst.name, ex)
-        return set()
+def _cleanup_zombies(inst: ArrInstance, s: requests.Session, cfg: Config,
+                     records: list[dict], dry_run: bool) -> list[dict]:
+    """Verwijder queue-rows waarvan de file al in de library zit. Returns
+    de overgebleven records (zonder zombies) zodat stalled-loop ze niet
+    nogmaals oppakt."""
+    if inst.is_sonarr:
+        series_ids = {r["seriesId"] for r in records if r.get("seriesId")}
+        ep_cache: dict[int, bool] = {}
+        for sid in series_ids:
+            try:
+                for e in arr_get(s, inst, "/episode", seriesId=sid):
+                    ep_cache[e["id"]] = bool(e.get("hasFile"))
+            except requests.HTTPError as ex:
+                log.warning("clean[%s]: episode cache fetch seriesId=%s failed: %s",
+                            inst.name, sid, ex)
+        zombies = _zombie_rows_sonarr(records, ep_cache)
+    else:
+        movie_ids = {r["movieId"] for r in records if r.get("movieId")}
+        mf_cache: dict[int, bool] = {}
+        for mid in movie_ids:
+            try:
+                mv = arr_get(s, inst, f"/movie/{mid}")
+                mf_cache[mid] = bool(mv.get("hasFile"))
+            except requests.HTTPError as ex:
+                log.warning("clean[%s]: movie fetch id=%s failed: %s", inst.name, mid, ex)
+        zombies = _zombie_rows_radarr(records, mf_cache)
 
-    imported_folders: set[str] = set()
-    for h in hist_recs:
-        data = h.get("data") or {}
-        dp = data.get("droppedPath")
-        if dp:
-            imported_folders.add(str(Path(dp).parent))
+    if not zombies:
+        return records
 
-    phantoms = [q for q in candidates if q.get("outputPath") in imported_folders]
-    if not phantoms:
-        log.debug("phantom[%s]: %d candidate row(s), 0 met succesvolle import",
-                  inst.name, len(candidates))
-        return set()
+    if len(zombies) > cfg.max_zombie_remove_per_run:
+        log.warning("clean[%s]: %d zombies exceeds cap %d, capping",
+                    inst.name, len(zombies), cfg.max_zombie_remove_per_run)
+        zombies = zombies[:cfg.max_zombie_remove_per_run]
 
-    by_folder: dict[str, list[dict]] = {}
-    for p in phantoms:
-        by_folder.setdefault(p["outputPath"], []).append(p)
-    log.info("phantom[%s]: %d row(s) over %d pack-folder(s) waar files al binnen zijn",
-             inst.name, len(phantoms), len(by_folder))
-
-    removed: set[int] = set()
-    for q in phantoms:
-        qid = q.get("id")
+    log.info("clean[%s]: %d zombie row(s) (file already in library), removing without blocklist",
+             inst.name, len(zombies))
+    removed_ids: set[int] = set()
+    for z in zombies:
+        qid = z.get("id")
+        title = (z.get("title") or "")[:80]
         if dry_run:
-            log.info("[dry-run] phantom[%s] would remove qid=%s outputPath=%s",
-                     inst.name, qid, (q.get("outputPath") or "")[:80])
-            removed.add(qid)
+            log.info("[dry-run] clean[%s] zombie qid=%s title=%s", inst.name, qid, title)
             continue
         try:
             arr_delete(s, inst, f"/queue/{qid}",
-                       removeFromClient="false", blocklist="false",
-                       skipRedownload="true")
-            removed.add(qid)
+                       removeFromClient="false", blocklist="false")
+            removed_ids.add(qid)
+            log.info("clean[%s]: zombie removed qid=%s title=%s", inst.name, qid, title)
         except requests.HTTPError as ex:
-            if ex.response is not None and ex.response.status_code == 404:
-                removed.add(qid)
-            else:
-                log.warning("phantom[%s]: delete qid=%s failed: %s", inst.name, qid, ex)
-    log.info("phantom[%s]: removed %d/%d row(s)", inst.name, len(removed), len(phantoms))
-    return removed
+            log.error("clean[%s]: zombie delete qid=%s failed: %s", inst.name, qid, ex)
+    log.info("clean[%s]: zombie summary removed=%d/%d",
+             inst.name, len(removed_ids), len(zombies))
+
+    zombie_qids = {z["id"] for z in zombies}
+    return [r for r in records if r["id"] not in zombie_qids]
 
 
 def _clean_for(inst: ArrInstance, s: requests.Session, cfg: Config, dry_run: bool) -> None:
@@ -952,10 +908,10 @@ def _clean_for(inst: ArrInstance, s: requests.Session, cfg: Config, dry_run: boo
         log.info("clean[%s]: queue empty", inst.name)
         return
 
-    # Eerst spook-rijen van succesvolle recover-imports opruimen (geen blocklist).
-    phantom_qids = _cleanup_recover_phantoms(inst, s, records, dry_run)
-    if phantom_qids:
-        records = [r for r in records if r.get("id") not in phantom_qids]
+    if cfg.zombie_cleanup_enabled:
+        records = _cleanup_zombies(inst, s, cfg, records, dry_run)
+        if not records:
+            return
 
     host_map = {inst.downloads_container: inst.downloads_host}
 
@@ -1001,14 +957,7 @@ def _clean_for(inst: ArrInstance, s: requests.Session, cfg: Config, dry_run: boo
                            removeFromClient="true", blocklist="true")
                 removed += 1
             except requests.HTTPError as ex:
-                # Multi-row groups: zodra één DELETE met removeFromClient=true slaagt,
-                # ruimt Sonarr/Radarr alle andere queue rows met dezelfde downloadId
-                # in één klap op. Volgende DELETEs krijgen dan 404 — dat is success.
-                if ex.response is not None and ex.response.status_code == 404:
-                    removed += 1
-                    log.debug("clean[%s]: qid=%s al weg (404, group-cascade)", inst.name, qid)
-                else:
-                    log.error("clean[%s]: delete qid=%s failed: %s", inst.name, qid, ex)
+                log.error("clean[%s]: delete qid=%s failed: %s", inst.name, qid, ex)
 
         log.info("clean[%s]: removed group downloadId=%s rows=%d/%d title=%s",
                  inst.name, gid, removed, len(rows), title)
@@ -1024,11 +973,404 @@ def cmd_clean(cfg: Config, dry_run: bool) -> None:
         _clean_for(inst, s, cfg, dry_run)
 
 
+# ---------- anime reclassify ----------
+
+def _norm_profile(name: str) -> str:
+    """Vergelijk profielnamen ongevoelig voor spaties/streepjes/case.
+    'Ultra-HD - Anime' == 'Ultra-HD-Anime' == 'ultra hd anime'."""
+    return re.sub(r"[\s_-]+", "", name or "").lower()
+
+
+def _resolve_profile_id(s: requests.Session, inst: ArrInstance, name: str) -> int | None:
+    target = _norm_profile(name)
+    try:
+        profiles = arr_get(s, inst, "/qualityprofile")
+    except requests.HTTPError as ex:
+        log.error("anime: qualityprofile lookup failed: %s", ex)
+        return None
+    for p in profiles:
+        if _norm_profile(p.get("name", "")) == target:
+            return p.get("id")
+    log.error("anime: quality profile %r not found (have: %s)",
+              name, ", ".join(p.get("name", "?") for p in profiles))
+    return None
+
+
+def _resolve_root_path(s: requests.Session, inst: ArrInstance, path: str) -> str | None:
+    want = path.rstrip("/")
+    try:
+        roots = arr_get(s, inst, "/rootfolder")
+    except requests.HTTPError as ex:
+        log.error("anime: rootfolder lookup failed: %s", ex)
+        return None
+    for r in roots:
+        if (r.get("path") or "").rstrip("/") == want:
+            return r.get("path").rstrip("/")
+    log.error("anime: root folder %r not configured in Sonarr (have: %s)",
+              path, ", ".join((r.get("path") or "?") for r in roots))
+    return None
+
+
+def _tmdb_is_anime(s: requests.Session, api_key: str, tmdb_id: int,
+                   cache: dict[int, bool]) -> bool:
+    """Vraag TMDb of een tv-serie anime is: keyword 'anime' (210024) OF
+    genre Animation (16) + origin_country bevat 'JP'. Resultaat per run gecached."""
+    if tmdb_id in cache:
+        return cache[tmdb_id]
+    verdict = False
+    try:
+        kw = s.get(f"{TMDB_API_BASE}/tv/{tmdb_id}/keywords",
+                   params={"api_key": api_key}, timeout=15)
+        if kw.status_code == 200:
+            for k in kw.json().get("results", []):
+                if k.get("id") == TMDB_ANIME_KEYWORD_ID or \
+                        (k.get("name", "").lower() == "anime"):
+                    verdict = True
+                    break
+        elif kw.status_code in (401, 403):
+            log.error("anime: TMDb auth failed (status %s) — check TMDB_API_KEY", kw.status_code)
+        if not verdict:
+            det = s.get(f"{TMDB_API_BASE}/tv/{tmdb_id}",
+                        params={"api_key": api_key}, timeout=15)
+            if det.status_code == 200:
+                d = det.json()
+                genre_ids = {g.get("id") for g in d.get("genres", [])}
+                countries = set(d.get("origin_country") or [])
+                if TMDB_ANIMATION_GENRE_ID in genre_ids and "JP" in countries:
+                    verdict = True
+    except requests.RequestException as ex:
+        log.warning("anime: TMDb lookup failed for tmdbId=%s: %s", tmdb_id, ex)
+    cache[tmdb_id] = verdict
+    return verdict
+
+
+def _is_anime(s: requests.Session, cfg: Config, series: dict,
+              tmdb_cache: dict[int, bool]) -> bool:
+    # 1. al handmatig/eerder als anime gemarkeerd — altijd waar.
+    if (series.get("seriesType") or "").lower() == "anime":
+        return True
+    # 2. TheTVDB-genre (lokaal, gratis) — tenzij detectie puur tmdb is.
+    if cfg.anime_detection in ("both", "tvdb"):
+        if any((g or "").strip().lower() == "anime" for g in (series.get("genres") or [])):
+            return True
+    # 3. TMDb-lookup (alleen als sleutel + tmdbId aanwezig).
+    if cfg.anime_detection in ("both", "tmdb") and cfg.tmdb_api_key:
+        tmdb_id = series.get("tmdbId")
+        if tmdb_id:
+            return _tmdb_is_anime(s, cfg.tmdb_api_key, tmdb_id, tmdb_cache)
+    return False
+
+
+def cmd_anime(cfg: Config, dry_run: bool) -> None:
+    s = make_session()
+    inst = cfg.sonarr
+
+    profile_id = _resolve_profile_id(s, inst, cfg.anime_quality_profile)
+    root_path = _resolve_root_path(s, inst, cfg.anime_root_folder)
+    if profile_id is None or root_path is None:
+        log.error("anime: cannot resolve target profile/root, aborting reclassify")
+        return
+
+    if cfg.anime_detection in ("both", "tmdb") and not cfg.tmdb_api_key:
+        log.warning("anime: TMDB_API_KEY empty — falling back to TheTVDB genre only")
+
+    try:
+        series_list = arr_get(s, inst, "/series")
+    except requests.HTTPError as ex:
+        log.error("anime: /series fetch failed: %s", ex)
+        return
+
+    tmdb_cache: dict[int, bool] = {}
+    detected = 0
+    to_change: list[dict] = []
+    for sr in series_list:
+        sid = sr.get("id")
+        if sid in cfg.anime_exclude_ids:
+            continue
+        if not _is_anime(s, cfg, sr, tmdb_cache):
+            continue
+        detected += 1
+        cur_type = (sr.get("seriesType") or "").lower()
+        cur_root = (sr.get("rootFolderPath") or "").rstrip("/")
+        cur_prof = sr.get("qualityProfileId")
+        if cur_type == "anime" and cur_root == root_path and cur_prof == profile_id:
+            continue  # al correct — idempotent skip
+        to_change.append(sr)
+
+    log.info("anime: %d/%d series detected as anime, %d need reclassify",
+             detected, len(series_list), len(to_change))
+
+    if len(to_change) > cfg.max_anime_reclassify_per_run:
+        log.warning("anime: %d need changes, capping at MAX_ANIME_RECLASSIFY_PER_RUN=%d",
+                    len(to_change), cfg.max_anime_reclassify_per_run)
+        to_change = to_change[:cfg.max_anime_reclassify_per_run]
+
+    for sr in to_change:
+        sid = sr.get("id")
+        title = sr.get("title") or sid
+        cur_root = (sr.get("rootFolderPath") or "").rstrip("/")
+        root_changes = cur_root != root_path
+        move = cfg.anime_move_files and root_changes
+        before = f"type={sr.get('seriesType')} root={cur_root} profile={sr.get('qualityProfileId')}"
+        after = f"type=anime root={root_path} profile={profile_id}"
+        if dry_run:
+            log.info("[dry-run] anime reclassify sid=%s %s | %s -> %s | moveFiles=%s",
+                     sid, title, before, after, move)
+            continue
+        try:
+            arr_put(s, inst, "/series/editor", {
+                "seriesIds": [sid],
+                "seriesType": "anime",
+                "qualityProfileId": profile_id,
+                "rootFolderPath": root_path,
+                "moveFiles": move,
+            })
+        except requests.HTTPError as ex:
+            log.error("anime: editor PUT failed sid=%s %s: %s", sid, title, ex)
+            continue
+        log.info("anime: reclassified sid=%s %s | %s -> %s | moveFiles=%s",
+                 sid, title, before, after, move)
+        if cfg.anime_refresh_after:
+            try:
+                arr_post(s, inst, "/command", {"name": "RefreshSeries", "seriesId": sid})
+            except requests.HTTPError as ex:
+                log.warning("anime: RefreshSeries failed sid=%s: %s", sid, ex)
+
+
+# ---------- plex audio language ----------
+
+def _int_tail(guid: str) -> int:
+    """Pak het eerste integer-id na '://' uit een Plex-guid."""
+    m = re.search(r"://(\d+)", guid or "")
+    return int(m.group(1)) if m else 0
+
+
+def _plex_show_ids(show: dict) -> tuple[int, int]:
+    """Return (tvdbId, tmdbId) uit Plex-show metadata. Ondersteunt zowel de
+    nieuwe Guid-array (tvdb://, tmdb://) als het oude legacy `guid`-veld."""
+    tvdb_id = tmdb_id = 0
+    for g in (show.get("Guid") or []):
+        gid = g.get("id") or ""
+        if gid.startswith("tvdb://"):
+            tvdb_id = _int_tail(gid)
+        elif gid.startswith("tmdb://"):
+            tmdb_id = _int_tail(gid)
+    legacy = show.get("guid") or ""
+    if not tvdb_id and "thetvdb" in legacy:
+        tvdb_id = _int_tail(legacy)
+    if not tmdb_id and ("themoviedb" in legacy or "tmdb" in legacy):
+        tmdb_id = _int_tail(legacy)
+    return tvdb_id, tmdb_id
+
+
+def _tmdb_original_language(s: requests.Session, api_key: str, tmdb_id: int,
+                           cache: dict[int, str | None]) -> str | None:
+    """ISO-639-1 original_language voor een TMDb tv-serie. Per run gecached."""
+    if tmdb_id in cache:
+        return cache[tmdb_id]
+    lang: str | None = None
+    try:
+        det = s.get(f"{TMDB_API_BASE}/tv/{tmdb_id}",
+                    params={"api_key": api_key}, timeout=15)
+        if det.status_code == 200:
+            lang = (det.json().get("original_language") or "").lower() or None
+        elif det.status_code in (401, 403):
+            log.error("plexlang: TMDb auth failed (status %s) — check TMDB_API_KEY",
+                      det.status_code)
+    except requests.RequestException as ex:
+        log.warning("plexlang: TMDb lookup failed tmdbId=%s: %s", tmdb_id, ex)
+    cache[tmdb_id] = lang
+    return lang
+
+
+def _desired_pref(orig_iso6391: str | None,
+                  fallback: tuple[str, ...]) -> tuple[str, ...]:
+    """Geordende lijst gewenste Plex audio-codes. TMDb-taal bekend -> die taal;
+    anders de geconfigureerde fallback-volgorde."""
+    if orig_iso6391:
+        codes = ISO6391_TO_PLEX_LANG.get(orig_iso6391.lower())
+        if codes:
+            return tuple(sorted(codes))
+    return fallback
+
+
+def _truthy(v) -> bool:
+    return v in (True, 1, "1") or (isinstance(v, str) and v.lower() == "true")
+
+
+def _stream_code(st: dict) -> str:
+    code = (st.get("languageCode") or "").lower()
+    if code:
+        return code
+    return PLEX_LANGNAME_TO_CODE.get((st.get("language") or "").lower(), "")
+
+
+def _pick_audio_stream(part: dict, pref_codes: tuple[str, ...]) -> dict | None:
+    """Kies de audiostream die best bij de voorkeurstalen past (hoogste channels
+    bij meerdere). None als geen enkele taal matcht."""
+    audio = [st for st in (part.get("Stream") or [])
+             if int(st.get("streamType", 0) or 0) == 2]
+    for code in pref_codes:
+        accept = PLEX_LANG_EQUIV.get(code, frozenset({code}))
+        matches = [st for st in audio if _stream_code(st) in accept]
+        if matches:
+            return max(matches, key=lambda st: int(st.get("channels", 0) or 0))
+    return None
+
+
+def _ensure_streams(s: requests.Session, cfg: Config, ep: dict) -> list[dict]:
+    """Geef Media[] van een aflevering terug met Stream-info. allLeaves bevat
+    streams meestal al; zo niet, haal de detail-metadata op."""
+    media = ep.get("Media") or []
+    needs = any("Stream" not in p
+                for m in media for p in (m.get("Part") or []))
+    if not needs:
+        return media
+    rk = ep.get("ratingKey")
+    try:
+        detail = plex_get(s, cfg, f"/library/metadata/{rk}") \
+            .get("MediaContainer", {}).get("Metadata", [])
+        if detail:
+            return detail[0].get("Media") or []
+    except requests.HTTPError as ex:
+        log.warning("plexlang: metadata fetch failed rk=%s: %s", rk, ex)
+    return media
+
+
+def cmd_plexlang(cfg: Config, dry_run: bool) -> None:
+    if not cfg.plex_url or not cfg.plex_token:
+        log.error("plexlang: PLEX_URL/PLEX_TOKEN not set in config.env — skipping")
+        return
+    s = make_session()
+    inst = cfg.sonarr
+
+    # 1. Anime-map uit Sonarr (seriesType=anime) — scope én taalbron.
+    try:
+        series_list = arr_get(s, inst, "/series")
+    except requests.HTTPError as ex:
+        log.error("plexlang: /series fetch failed: %s", ex)
+        return
+    anime_by_tvdb: dict[int, dict] = {}
+    anime_by_tmdb: dict[int, dict] = {}
+    for sr in series_list:
+        if (sr.get("seriesType") or "").lower() != "anime":
+            continue
+        entry = {"title": sr.get("title"), "tmdbId": int(sr.get("tmdbId") or 0)}
+        if sr.get("tvdbId"):
+            anime_by_tvdb[int(sr["tvdbId"])] = entry
+        if sr.get("tmdbId"):
+            anime_by_tmdb[int(sr["tmdbId"])] = entry
+    if not anime_by_tvdb and not anime_by_tmdb:
+        log.info("plexlang: no Sonarr series with seriesType=anime — nothing to do")
+        return
+    log.info("plexlang: anime series in Sonarr: %d with tvdbId, %d with tmdbId",
+             len(anime_by_tvdb), len(anime_by_tmdb))
+
+    # 2. Plex show-secties (optioneel op naam gefilterd).
+    try:
+        sections = plex_get(s, cfg, "/library/sections") \
+            .get("MediaContainer", {}).get("Directory", [])
+    except requests.HTTPError as ex:
+        log.error("plexlang: /library/sections failed: %s", ex)
+        return
+    show_sections = [d for d in sections if d.get("type") == "show"]
+    if cfg.plex_anime_sections:
+        wanted = {n.lower() for n in cfg.plex_anime_sections}
+        show_sections = [d for d in show_sections
+                         if (d.get("title") or "").lower() in wanted]
+    if not show_sections:
+        log.warning("plexlang: no matching Plex show sections (filter=%s)",
+                    list(cfg.plex_anime_sections) or "all")
+        return
+
+    tmdb_lang_cache: dict[int, str | None] = {}
+    changed = 0
+    capped = False
+
+    for sec in show_sections:
+        if capped:
+            break
+        key = sec.get("key")
+        try:
+            shows = plex_get(s, cfg, f"/library/sections/{key}/all", type=2) \
+                .get("MediaContainer", {}).get("Metadata", [])
+        except requests.HTTPError as ex:
+            log.error("plexlang: section %s listing failed: %s", key, ex)
+            continue
+
+        for show in shows:
+            if capped:
+                break
+            tvdb_id, tmdb_id = _plex_show_ids(show)
+            entry = anime_by_tvdb.get(tvdb_id) or anime_by_tmdb.get(tmdb_id)
+            if entry is None:
+                log.debug("plexlang: skip unmatched/non-anime %r (tvdb=%s tmdb=%s)",
+                          show.get("title"), tvdb_id, tmdb_id)
+                continue
+
+            tmdb_for_lang = entry.get("tmdbId") or tmdb_id
+            orig = None
+            if cfg.tmdb_api_key and tmdb_for_lang:
+                orig = _tmdb_original_language(s, cfg.tmdb_api_key,
+                                               int(tmdb_for_lang), tmdb_lang_cache)
+            pref = _desired_pref(orig, cfg.plex_audio_fallback)
+            log.debug("plexlang: anime %r -> orig=%s pref=%s",
+                      show.get("title"), orig, pref)
+
+            rk = show.get("ratingKey")
+            try:
+                leaves = plex_get(s, cfg, f"/library/metadata/{rk}/allLeaves") \
+                    .get("MediaContainer", {}).get("Metadata", [])
+            except requests.HTTPError as ex:
+                log.error("plexlang: allLeaves failed for %r: %s",
+                          show.get("title"), ex)
+                continue
+
+            for ep in leaves:
+                if capped:
+                    break
+                ep_label = f"{show.get('title')} S{ep.get('parentIndex')}E{ep.get('index')}"
+                for media in _ensure_streams(s, cfg, ep):
+                    if capped:
+                        break
+                    for part in (media.get("Part") or []):
+                        st = _pick_audio_stream(part, pref)
+                        if st is None:
+                            log.debug("plexlang: no %s audio :: %s", pref, ep_label)
+                            continue
+                        if _truthy(st.get("selected")):
+                            continue  # idempotent: al de default
+                        if changed >= cfg.max_plex_audio_parts_per_run:
+                            log.warning("plexlang: reached cap %d, stopping",
+                                        cfg.max_plex_audio_parts_per_run)
+                            capped = True
+                            break
+                        code = _stream_code(st)
+                        if dry_run:
+                            log.info("[dry-run] plexlang set audio id=%s (%s) :: %s",
+                                     st.get("id"), code, ep_label)
+                            changed += 1
+                            continue
+                        try:
+                            plex_put(s, cfg, f"/library/parts/{part.get('id')}",
+                                     audioStreamID=st.get("id"))
+                            changed += 1
+                            log.info("plexlang: set audio id=%s (%s) :: %s",
+                                     st.get("id"), code, ep_label)
+                        except requests.HTTPError as ex:
+                            log.error("plexlang: PUT part %s failed: %s",
+                                      part.get("id"), ex)
+
+    log.info("plexlang: done, %d part(s) %s", changed,
+             "would change (dry-run)" if dry_run else "changed")
+
+
 # ---------- entry ----------
 
 def main() -> int:
     p = argparse.ArgumentParser(description="arr-janitor")
-    p.add_argument("command", choices=["extract", "import", "clean", "all"])
+    p.add_argument("command",
+                   choices=["extract", "import", "clean", "all", "anime", "plexlang"])
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
@@ -1036,8 +1378,14 @@ def main() -> int:
     setup_logging(args.verbose)
     cfg = load_config()
 
+    # 'anime' en 'plexlang' krijgen elk een eigen lock zodat ze nooit botsen
+    # met de 5x/nacht extract/import/clean-cyclus (en met elkaar).
+    lock_path = {
+        "anime": ANIME_LOCK_PATH,
+        "plexlang": PLEX_LOCK_PATH,
+    }.get(args.command, LOCK_PATH)
     try:
-        lock_fd = acquire_lock()
+        lock_fd = acquire_lock(lock_path)
     except _LockHeld:
         log.info("previous run still active, exiting")
         return 0
@@ -1051,6 +1399,10 @@ def main() -> int:
             cmd_import(cfg, args.dry_run)
         if args.command in ("clean", "all"):
             cmd_clean(cfg, args.dry_run)
+        if args.command == "anime":
+            cmd_anime(cfg, args.dry_run)
+        if args.command == "plexlang":
+            cmd_plexlang(cfg, args.dry_run)
         log.info("=== done ===")
         return 0
     except Exception:

@@ -16,6 +16,8 @@ archieven uit. Eén Python-script, geen extra dependencies behalve `requests`.
 | `import` | Vraagt Radarr/Sonarr `manualimport` API om kandidaten in `completed/`. Pusht alleen kandidaten met **zekere match** (geen rejections, movie/series id aanwezig, voor Sonarr ook episodeIds non-empty). Twijfelgevallen worden gelogd. |
 | `clean` | Verwijdert items uit de queue die `>= STALLED_HOURS` vastzitten of failed/warning-status hebben. Blocklist + optioneel re-search. |
 | `all` | extract → import → clean. Gebruikt door cron. |
+| `anime` | Scant alle Sonarr-series, detecteert welke anime zijn en zet ze op `seriesType=anime`, de anime-root (`/anime-tv`) en het profiel `Ultra-HD - Anime`. Verplaatst de files mee (`moveFiles`). Idempotent: al-correcte series worden overgeslagen. Eigen lock + eigen cron-regel (05:00), **niet** onderdeel van `all`. |
+| `plexlang` | Zet in Plex per aflevering de default **audiotrack** op de oorspronkelijke taal (meestal Japans, soms Koreaans/Chinees), **alleen voor anime**. Een Plex-show wordt enkel aangeraakt als hij op tvdbId/tmdbId matcht met een Sonarr-serie met `seriesType=anime`. Originele taal komt uit TMDb (`original_language`), met fallback `PLEX_AUDIO_FALLBACK`. Ondertitels blijven onaangeroerd. Idempotent, gecapt, eigen lock + eigen cron (05:30), **niet** onderdeel van `all`. |
 
 ## Flags
 
@@ -25,7 +27,7 @@ archieven uit. Eén Python-script, geen extra dependencies behalve `requests`.
 ## Eerste gebruik
 
 ```bash
-cd ~/scripts/arr-janitor
+cd /home/laominecon/scripts/arr-janitor
 # 1. Lees-test (geen mutaties)
 python3 arr_janitor.py all --dry-run --verbose
 
@@ -37,19 +39,97 @@ python3 arr_janitor.py clean  --dry-run --verbose
 
 ## Cron (5x per nacht)
 
+Als user `laominecon`:
+
 ```cron
-0 22,0,2,4,6 * * * /usr/bin/python3 /home/sven/scripts/arr-janitor/arr_janitor.py all >> /home/sven/scripts/arr-janitor/cron.log 2>&1
+0 22,0,2,4,6 * * * /usr/bin/python3 /home/laominecon/scripts/arr-janitor/arr_janitor.py all >> /home/laominecon/scripts/arr-janitor/cron.log 2>&1
 ```
 
 Runs: 22:00, 00:00, 02:00, 04:00, 06:00.
 
+Plus de anime-reclassify, dagelijks 05:00 (eigen lock, los van `all`):
+
+```cron
+0 5 * * * /usr/bin/python3 /home/laominecon/scripts/arr-janitor/arr_janitor.py anime >> /home/laominecon/scripts_logs/arr_janitor_cron.log 2>&1
+```
+
+Plus de plex audio-language, dagelijks 05:30 (na de anime-reclassify, eigen lock):
+
+```cron
+30 5 * * * /usr/bin/python3 /home/laominecon/scripts/arr-janitor/arr_janitor.py plexlang >> /home/laominecon/scripts_logs/arr_janitor_cron.log 2>&1
+```
+
+### anime-detectie
+
+Een serie geldt als anime als één van deze waar is:
+1. `seriesType` is al `anime`, **of**
+2. Sonarr's genre-lijst (van TheTVDB) bevat `Anime`, **of**
+3. TMDb zegt anime — keyword `anime` (210024) óf genre Animation + origin
+   country `JP`. Vereist een gratis `TMDB_API_KEY` in `config.env`; leeg = stap 3
+   wordt overgeslagen (alleen TVDB-genre). Zet `ANIME_DETECTION=both|tvdb|tmdb`.
+
+False positives pin je in `ANIME_EXCLUDE_IDS` (komma-gescheiden Sonarr series-id's).
+Cap per run: `MAX_ANIME_RECLASSIFY_PER_RUN` (default 25). Voor de eerste
+migratie in één keer: cap tijdelijk verhogen en `anime --verbose` los draaien.
+
+### plex audio language (`plexlang`)
+
+Plex' audio-taalvoorkeur is **per account en globaal** — je kunt die niet per
+bibliotheek instellen. Om anime tóch automatisch in de originele taal te spelen
+zónder gewone TV/films te raken, zet `plexlang` de **default audiotrack per
+aflevering** via de Plex API (`PUT /library/parts/{id}?audioStreamID=...`).
+Omkeerbaar, wijzigt geen bestanden, geldt server-breed voor wie zelf geen track
+koos.
+
+Anime-only is *by construction*: een Plex-show wordt alleen aangeraakt als hij
+op **tvdbId/tmdbId** matcht met een Sonarr-serie met `seriesType=anime` (precies
+de series die het `anime`-commando classificeert — "in de anime-map of met de
+anime-tag"). Geen ID-match → overgeslagen. Niet-anime wordt dus nooit geraakt.
+
+De originele taal komt per serie uit **TMDb** (`original_language`, vereist
+`TMDB_API_KEY`) en wordt op de bijbehorende audiotrack gezet (`ja→jpn`,
+`ko→kor`, `zh→zho/chi/cmn/yue`). Geen TMDb-key of geen resultaat → de
+`PLEX_AUDIO_FALLBACK`-volgorde (default `jpn,kor,zho`). Bij meerdere matchende
+tracks wint de hoogste kanaaltelling. Al-geselecteerde tracks worden
+overgeslagen (idempotent). **Ondertitels worden niet aangeraakt** — die regelt
+het aparte subtitle-script.
+
+Config: `PLEX_URL`, `PLEX_TOKEN`, optioneel `PLEX_ANIME_SECTIONS` (sectienamen),
+`PLEX_AUDIO_FALLBACK`, en cap `MAX_PLEX_AUDIO_PARTS_PER_RUN` (default 1000 — de
+eerste backfill kan groot zijn; daarna blijft het laag). Token ophalen: in de
+Plex-webapp een item → `…` → Get Info → **View XML**; de URL bevat
+`X-Plex-Token=...`.
+
 ## Prerequisites
 
-| Tool | Nodig voor |
-|---|---|
-| Python 3.11 + `requests` | alles |
-| `7z` (`p7zip-full`) | extract `.zip` `.7z` |
-| `unrar` of `unar` | extract `.rar` |
+| Tool | Status op deze server | Nodig voor |
+|---|---|---|
+| Python 3.11 + `requests` | ✓ aanwezig | alles |
+| `7z` | ✓ aanwezig | extract `.zip` `.7z` |
+| `unrar` of `unar` | **ontbreekt** — `sudo apt install unrar` | extract `.rar` |
+
+Zonder `unrar` worden `.rar` archieven gewoon overgeslagen met een WARNING — de
+rest blijft werken. nzbget pakt al uit (Unpack=yes voor beide categorieën),
+dus dit komt zelden voor.
+
+## Configuratie (`config.env`)
+
+Mode 600. Bevat API-keys + paden + drempels. Zie het bestand voor uitleg.
+
+Belangrijkste schakelaar:
+- `IMPORT_MODE=Copy` — origineel blijft staan na import (veilig, rollback mogelijk).
+- Na ~2 weken zonder problemen → `IMPORT_MODE=Move` zodat `completed/` wordt opgeruimd.
+
+## Logging
+
+- `arr_janitor.log` — rotating, 5 MB × 5. Eén regel per actie.
+- `cron.log` — cron's stdout/stderr (zou leeg moeten blijven, alleen vangnet).
+
+## Lockfile
+
+`fcntl.flock` op `.lock`. Als een vorige run nog draait, exit het script
+direct met code 0 en logt "previous run still active". Voorkomt overlap
+zonder cron-gymnastiek.
 
 ## Veiligheid
 
@@ -59,35 +139,24 @@ Runs: 22:00, 00:00, 02:00, 04:00, 06:00.
 - Caps: max 50 imports en max 20 removals per run.
 - API retry: 3x op 5xx, exponential backoff, 30s timeout.
 
-## Lockfile
+## Troubleshooting
 
-`fcntl.flock` op `.lock`. Als een vorige run nog draait, exit het script
-direct met code 0 en logt "previous run still active". Voorkomt overlap
-zonder cron-gymnastiek.
+**"FATAL: missing config file"** — je draait niet vanuit de juiste cwd of
+`config.env` bestaat niet. Het script zoekt `config.env` naast zichzelf.
 
-## Anime-scripts (los van het hoofdscript)
+**"manualimport GET failed: 401"** — verkeerde API-key. Pak hem opnieuw uit
+`/home/laominecon/compose/{radarr,sonarr}/data/config.xml` (`<ApiKey>`).
 
-Twee aanvullende nachtelijke scripts, onafhankelijk van `arr_janitor.py`. Ze laden
-config uit de gedeelde `/home/sven/scripts/secrets/config.env` (Radarr/Sonarr/Emby +
-Telegram), delen helpers via `anime_common.py`, en hebben elk een eigen lockfile en log
-in `/home/sven/scripts/logs/`.
+**Imports doen niets** — check `arr_janitor.log` op `WARNING import[xxx]: skip`.
+Toont rejections. Vaakste oorzaken: film/serie nog niet aan Radarr/Sonarr
+toegevoegd, of file-naam niet matchbaar. Voeg de film/serie eerst toe of hernoem
+de file zodat de parser het oppikt.
 
-| Script | Doet |
-|---|---|
-| `anime_sort.py` | Detecteert anime (genre Animation/Anime **én** originalLanguage Japans/Chinees/Koreaans via TVDB) die nog in `/movies` of `/tv` staat, en verplaatst die via de Radarr/Sonarr editor-API (`moveFiles=true`) naar `/anime-movies` / `/anime-tv`. Zet het Anime-quality-profiel; voor Japanse/al-anime series ook `seriesType=anime` (Chinese/Koreaanse `standard`-donghua blijven standard). Live-action Japans (geen Animation-genre) blijft staan. Bestaat de doelmap al mét bestanden (dubbele kopie) → overslaan + waarschuwen. |
-| `anime_audio.py` | Zet per anime-bestand de audiotrack in de **originele taal** (per titel uit TVDB) als default-track-flag — `mkvpropedit` voor `.mkv`, `ffmpeg -c copy` remux voor `.mp4` — zodat Emby/Plex standaard de originele audio (jpn/zho/kor/…) speelt. Idempotent (slaat bestanden die al goed staan over), met state-cache op pad+mtime. Triggert daarna een Emby library-refresh. |
+**Cron draait niet** — `crontab -l -u laominecon` checken; `journalctl -u cron --since "1 hour ago"`.
 
-Flags: `--dry-run`, `--verbose` (en `anime_audio.py` ook `--no-cache`).
+## Wat dit script niet doet
 
-Optionele config-keys (defaults in code): `ANIME_LANGS` (default `Japanese,Chinese,Korean`),
-`ANIME_MAX_MOVES_PER_RUN` (20), `ANIME_AUDIO_MAX_PER_RUN` (1000).
-
-Extra prerequisites: `mkvtoolnix` (`mkvpropedit` + `mkvmerge`) naast `ffmpeg`/`ffprobe`.
-
-Cron (na arr-janitor om 22/00/02/04/06 en dv-guard om 05:00; sort vóór audio zodat
-nieuw-verplaatste anime dezelfde nacht audio-gefixt wordt):
-
-```cron
-0 3 * * *  /usr/bin/python3 /home/sven/scripts/arr-janitor/anime_sort.py  >> /home/sven/scripts/logs/anime_sort_cron.log 2>&1
-30 3 * * * /usr/bin/python3 /home/sven/scripts/arr-janitor/anime_audio.py >> /home/sven/scripts/logs/anime_audio_cron.log 2>&1
-```
+- Geen "search missing" — gebruik huntarr (`http://localhost:9705`).
+- Geen webhooks/realtime triggers — bewust cron, simpeler.
+- Geen wijzigingen aan nzbget/Docker config.
+- Geen notifications — kan later via huntarr's eigen webhook.
