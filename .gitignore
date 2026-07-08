@@ -1,0 +1,13 @@
+# Secrets / config
+config.env
+
+# Logs
+*.log
+
+# Lock files
+.lock
+.lock-*
+
+# Python
+__pycache__/
+*.py[cod]
