@@ -14,6 +14,7 @@ echo ""
 command -v python3 >/dev/null || echo "WAARSCHUWING: python3 niet gevonden"
 python3 -c "import requests" 2>/dev/null || echo "WAARSCHUWING: python3-requests ontbreekt"
 python3 -c "import dotenv"   2>/dev/null || echo "WAARSCHUWING: python-dotenv ontbreekt (nodig voor anime-scripts)"
+command -v ffprobe >/dev/null || echo "WAARSCHUWING: ffprobe ontbreekt (nodig voor dv_guard.py)"
 
 # --- helper: prompt met default ---
 ask() {  # ask VAR "vraag" "default"
@@ -61,6 +62,7 @@ Voorgestelde cron-regels (crontab -e als de user die de media beheert):
   0 22,0,2,4,6 * * * /usr/bin/python3 $SCRIPT_DIR/arr_janitor.py all >> $SCRIPT_DIR/cron.log 2>&1
   0 5 * * * /usr/bin/python3 $SCRIPT_DIR/arr_janitor.py anime >> $SCRIPT_DIR/cron.log 2>&1
   30 5 * * * /usr/bin/python3 $SCRIPT_DIR/arr_janitor.py plexlang >> $SCRIPT_DIR/cron.log 2>&1
+  0 5 * * * /usr/bin/python3 $SCRIPT_DIR/dv_guard.py >> $SCRIPT_DIR/cron.log 2>&1
 
 Klaar.
 EOF

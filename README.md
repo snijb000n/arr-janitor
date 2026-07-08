@@ -64,6 +64,28 @@ Plus de plex audio-language, dagelijks 05:30 (na de anime-reclassify, eigen lock
 30 5 * * * /usr/bin/python3 /pad/naar/arr-janitor/arr_janitor.py plexlang >> /pad/naar/arr-janitor/cron.log 2>&1
 ```
 
+Plus dv-guard, dagelijks 05:00 (eigen lock, los script):
+
+```cron
+0 5 * * * /usr/bin/python3 /pad/naar/arr-janitor/dv_guard.py >> /pad/naar/arr-janitor/cron.log 2>&1
+```
+
+### dv-guard (`dv_guard.py`)
+
+Los script (geen subcommando) dat de hele Radarr/Sonarr-bibliotheek scant op
+**Dolby Vision**- en **3D**-bestanden en voor de gevonden items automatisch
+vervangende searches triggert (`MoviesSearch`/`SeasonSearch`). Detectie is
+dubbel: bestandsnaam-patronen (`DV`, `DoVi`, `Dolby Vision`, DV-hybrides, `3D`,
+`SBS`, `OU/TAB`) én echte codec-metadata via `ffprobe` (DOVI configuration
+record, 8 parallelle workers). Uitzonderingslijst voor titels met "3D" in de
+naam (*Saw 3D* e.d.).
+
+Vereist in Radarr én Sonarr de custom formats **'Dolby Vision (Block)'**,
+**'3D (Block)'** en **'All Releases (Baseline)'** — die zorgen dat de
+vervangende grab geen DV/3D-release pakt. Het script waarschuwt als ze
+ontbreken. Vereist `ffprobe` op het systeem. Flags: `--dry-run` (geen
+searches), `--verbose`. Machinepaden via `machine.env` (zie hieronder).
+
 ### anime-detectie
 
 Een serie geldt als anime als één van deze waar is:
