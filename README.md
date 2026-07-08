@@ -84,7 +84,34 @@ Vereist in Radarr én Sonarr de custom formats **'Dolby Vision (Block)'**,
 **'3D (Block)'** en **'All Releases (Baseline)'** — die zorgen dat de
 vervangende grab geen DV/3D-release pakt. Het script waarschuwt als ze
 ontbreken. Vereist `ffprobe` op het systeem. Flags: `--dry-run` (geen
-searches), `--verbose`. Machinepaden via `machine.env` (zie hieronder).
+searches/deletes/grabs), `--verbose`. Machinepaden via `machine.env`
+(zie hieronder).
+
+**Levenscyclus & vervang-motor.** Radarr/Sonarr downgraden nooit uit
+zichzelf, dus DV-bestanden waarvoor geen gelijkwaardige non-DV release
+bestaat blijven anders eeuwig staan. Daarom (state in
+`dv_guard_state.json`, gitignored):
+
+1. Nieuw gedetecteerd item → `active`: doet `DV_ACTIVE_NIGHTS` (7) nachten
+   mee in de nachtelijke batch-search (native upgrade-kans).
+2. Daarna → `parked` (skip-lijst): geen nachtelijke search meer — scheelt
+   honderden zinloze indexer-searches per nacht.
+3. Op `DV_REPLACE_WEEKDAY` (zondag) draait de **vervang-motor** over de
+   geparkeerde items, max `DV_REPLACE_CAP` (15) pogingen per run:
+   interactieve indexer-search → beste non-DV release volgens de
+   **kwaliteitsladder van het eigen quality profile** (profielvolgorde
+   hoog→laag: eerst WEB-2160p, desnoods 1080p, dan 720p) → pas als er een
+   kandidaat is wordt de oude file verwijderd en die release gegrabt.
+   Mislukt de download alsnog, dan staat het item op 'missing' en zoekt
+   Radarr/Sonarr/huntarr native verder (zonder bestaand bestand geldt de
+   downgrade-blokkade niet meer). Niets gevonden → geparkeerd tot de
+   volgende zondag.
+4. Blijkt een item ná vervanging opnieuw DV (codec in de nieuwe file), dan
+   wordt het permanent geparkeerd en door de motor overgeslagen
+   (loop-preventie; handmatige aandacht nodig).
+
+Bij series: per-aflevering grabs; een season pack alleen als het héle
+seizoen DV is. Config-keys: zie `machine.env.example`.
 
 ### anime-detectie
 

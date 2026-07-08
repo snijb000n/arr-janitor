@@ -206,6 +206,14 @@ def arr_post(which: str, path: str, body, **params):
     return r.json() if r.content else {}
 
 
+def arr_delete(which: str, path: str, **params):
+    url, key = _arr_target(which)
+    r = SESSION.delete(f"{url}/api/v3{path}", headers={"X-Api-Key": key},
+                       params=params, timeout=60)
+    r.raise_for_status()
+    return r.json() if r.content else None
+
+
 def resolve_rootfolder(which: str, container_path: str) -> str | None:
     """Geef het exacte rootFolderPath terug zoals *arr het kent."""
     for rf in arr_get(which, "/rootfolder") or []:
