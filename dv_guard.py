@@ -20,6 +20,14 @@ Levenscyclus per gedetecteerd item (state in dv_guard_state.json):
   4. Items die na een vervanging opnieuw DV blijken -> direct geparkeerd en
      door de motor overgeslagen (loop-preventie, handmatige aandacht nodig).
 
+Met DV_DELETE_IMMEDIATE=true (machine.env) worden gedetecteerde DV/3D-files
+DIRECT verwijderd bij detectie — niet wachten op een vervangings-kandidaat.
+De vervanging gebeurt daarna native: het item staat 'missing', de nachtelijke
+batch-search (en Radarr/Sonarr/huntarr zelf) grabt de beste toegestane
+release via de profiel-ladder, en de custom formats blokkeren DV/3D.
+De loop-preventie (punt 4) blijft gelden: opnieuw-DV na vervanging wordt
+niet nogmaals verwijderd maar geparkeerd (markers verlopen na 90 dagen).
+
 Config via anime_common: machine.env (SECRETS_FILE/LOG_DIR/MEDIA_ROOT) +
 fleet-secrets. Motor-gedrag via env/machine.env: DV_ACTIVE_NIGHTS,
 DV_REPLACE_WEEKDAY, DV_REPLACE_CAP, DV_REPLACE_ENABLE.
@@ -34,7 +42,7 @@ import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import anime_common as ac
@@ -47,6 +55,8 @@ DV_ACTIVE_NIGHTS = int(os.getenv("DV_ACTIVE_NIGHTS", "7"))
 DV_REPLACE_WEEKDAY = int(os.getenv("DV_REPLACE_WEEKDAY", "6"))  # Python: 0=ma, 6=zo
 DV_REPLACE_CAP = int(os.getenv("DV_REPLACE_CAP", "15"))
 DV_REPLACE_ENABLE = os.getenv("DV_REPLACE_ENABLE", "true").strip().lower() in ("1", "true", "yes")
+DV_DELETE_IMMEDIATE = os.getenv("DV_DELETE_IMMEDIATE", "false").strip().lower() in ("1", "true", "yes")
+REPLACED_MARKER_DAYS = 90  # loop-preventie-markers verlopen hierna
 
 # Bestandsnaam-patronen
 DV_PATTERN = re.compile(r'\b(DV|DoVi|Dolby[. ]?Vision)\b', re.IGNORECASE)
@@ -233,6 +243,10 @@ def load_state():
     state.setdefault('seasons', {})
     state.setdefault('replaced', {}).setdefault('movies', {})
     state['replaced'].setdefault('seasons', {})
+    # verlopen loop-preventie-markers opruimen
+    cutoff = (datetime.now() - timedelta(days=REPLACED_MARKER_DAYS)).isoformat(timespec='seconds')
+    for kind in ('movies', 'seasons'):
+        state['replaced'][kind] = {k: v for k, v in state['replaced'][kind].items() if v >= cutoff}
     return state
 
 
@@ -271,11 +285,64 @@ def update_bucket(bucket, detected_keys, replaced, label):
         log.info(f'{label}: {len(gone)} item(s) niet meer DV -> uit de lijst')
 
 
-# ---------- nachtelijke batch-search (alleen 'active' items) ----------
+# ---------- direct delete (DV_DELETE_IMMEDIATE) ----------
 
-def nightly_search(state, det_movies, det_seasons, dry_run):
+def immediate_delete(state, det_movies, det_seasons, dry_run):
+    """Verwijder gedetecteerde DV/3D-files direct (user-beleid: DV mag weg,
+    desnoods zonder klaarstaande vervanging). Items met een replaced-marker
+    worden overgeslagen (loop-preventie). Return (movie_keys, season_keys)
+    van verwijderde items, zodat de batch-search ze direct opnieuw zoekt."""
+    del_m, del_s = set(), set()
+    for key, movie in sorted(det_movies.items()):
+        if not movie or key in state['replaced']['movies']:
+            continue
+        mf = movie.get('movieFile') or {}
+        if not mf.get('id'):
+            continue
+        if dry_run:
+            log.info(f'  [dry-run] direct delete: {movie["title"]} - {mf.get("relativePath", "")}')
+            del_m.add(key)
+            continue
+        try:
+            ac.arr_delete('radarr', f'/moviefile/{mf["id"]}')
+            state['replaced']['movies'][key] = _now()
+            del_m.add(key)
+            log.info(f'  direct delete: {movie["title"]} - {mf.get("relativePath", "")}')
+        except Exception as e:
+            log.error(f'  direct delete mislukt voor {movie.get("title")}: {e}')
+
+    for key, entry in sorted(det_seasons.items()):
+        if not entry or key in state['replaced']['seasons']:
+            continue
+        title = f'{entry["series"]["title"]} S{entry["season"]:02d}'
+        if dry_run:
+            log.info(f'  [dry-run] direct delete: {title} ({len(entry["dv_file_ids"])} files)')
+            del_s.add(key)
+            continue
+        ok = 0
+        for fid in entry['dv_file_ids']:
+            try:
+                ac.arr_delete('sonarr', f'/episodefile/{fid}')
+                ok += 1
+            except Exception as e:
+                log.error(f'  direct delete mislukt voor {title} file {fid}: {e}')
+        if ok:
+            state['replaced']['seasons'][key] = _now()
+            del_s.add(key)
+            log.info(f'  direct delete: {title} ({ok}/{len(entry["dv_file_ids"])} files)')
+
+    if del_m or del_s:
+        log.info(f'Direct delete: {len(del_m)} films en {len(del_s)} seizoenen verwijderd '
+                 f'— native search + profiel-ladder regelt de vervanging')
+    return del_m, del_s
+
+
+# ---------- nachtelijke batch-search ('active' items + zojuist verwijderde) ----------
+
+def nightly_search(state, det_movies, det_seasons, dry_run,
+                   extra_movies=frozenset(), extra_seasons=frozenset()):
     movie_ids = [int(k) for k, v in state['movies'].items()
-                 if v['status'] == 'active' and det_movies.get(k)]
+                 if (v['status'] == 'active' or k in extra_movies) and det_movies.get(k)]
     if movie_ids:
         if dry_run:
             log.info(f'[dry-run] Radarr: MoviesSearch voor {len(movie_ids)} films overgeslagen')
@@ -286,7 +353,7 @@ def nightly_search(state, det_movies, det_seasons, dry_run):
         log.info('Radarr: geen active films voor nachtelijke search')
 
     season_keys = [k for k, v in state['seasons'].items()
-                   if v['status'] == 'active' and det_seasons.get(k)]
+                   if (v['status'] == 'active' or k in extra_seasons) and det_seasons.get(k)]
     if not season_keys:
         log.info('Sonarr: geen active seizoenen voor nachtelijke search')
     elif dry_run:
@@ -560,7 +627,12 @@ def main():
         update_bucket(state['movies'], set(det_movies), state['replaced']['movies'], 'Radarr')
         update_bucket(state['seasons'], set(det_seasons), state['replaced']['seasons'], 'Sonarr')
 
-        nightly_search(state, det_movies, det_seasons, args.dry_run)
+        deleted_m, deleted_s = set(), set()
+        if DV_DELETE_IMMEDIATE:
+            deleted_m, deleted_s = immediate_delete(state, det_movies, det_seasons, args.dry_run)
+
+        nightly_search(state, det_movies, det_seasons, args.dry_run,
+                       extra_movies=deleted_m, extra_seasons=deleted_s)
 
         if not DV_REPLACE_ENABLE:
             log.info('Vervang-motor uitgeschakeld (DV_REPLACE_ENABLE)')

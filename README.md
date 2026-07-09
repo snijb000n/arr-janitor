@@ -113,6 +113,16 @@ bestaat blijven anders eeuwig staan. Daarom (state in
 Bij series: per-aflevering grabs; een season pack alleen als het héle
 seizoen DV is. Config-keys: zie `machine.env.example`.
 
+**Direct delete (`DV_DELETE_IMMEDIATE=true`, opt-in per machine).** DV/3D
+is hier per definitie onafspeelbaar, dus gedetecteerde files mogen meteen
+weg zonder te wachten op een vervangings-kandidaat. Bij detectie wordt de
+file direct verwijderd en het item meegenomen in de batch-search; het staat
+dan 'missing', waardoor Radarr/Sonarr (en huntarr) native de beste
+toegestane release grabben via de profiel-ladder — DV/3D blijft geblokt
+door de custom formats. De loop-preventie blijft: een item dat na
+vervanging opnieuw DV blijkt wordt níét nogmaals verwijderd maar geparkeerd
+(markers verlopen na 90 dagen). Default `false`.
+
 ### anime-detectie
 
 Een serie geldt als anime als één van deze waar is:
