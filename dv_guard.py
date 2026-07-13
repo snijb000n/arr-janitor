@@ -14,9 +14,11 @@ Levenscyclus per gedetecteerd item (state in dv_guard_state.json):
   3. Op DV_REPLACE_WEEKDAY (default zondag) draait de vervang-motor over de
      geparkeerde items (max DV_REPLACE_CAP per run): interactieve
      indexer-search, beste non-DV release volgens de kwaliteitsladder van het
-     eigen quality profile (hoog->laag, dus desnoods 1080p/720p), dan pas
-     oude file verwijderen + release grabben. Niets gevonden -> geparkeerd
-     tot de volgende motor-dag.
+     eigen quality profile (hoog->laag, dus desnoods 1080p/720p) en binnen de
+     size-limieten van de quality definitions (onze POST /release omzeilt de
+     native size-check, dus die dwingen we zelf af), dan pas oude file
+     verwijderen + release grabben. Niets gevonden -> geparkeerd tot de
+     volgende motor-dag.
   4. Items die na een vervanging opnieuw DV blijken -> direct geparkeerd en
      door de motor overgeslagen (loop-preventie, handmatige aandacht nodig).
 
@@ -403,7 +405,18 @@ def _profile_ladder(which, profile_id, cache):
     return cache[ck]
 
 
-def _candidate_key(rel, ranks):
+def _size_limits(which, cache):
+    """Quality-id -> maxSize (MB/min) uit de quality definitions; None of
+    ontbrekend = onbeperkt. Zelfde limieten die Radarr/Sonarr zelf op
+    automatische grabs toepassen - onze grab via POST /release omzeilt die
+    check, dus we dwingen ze hier zelf af."""
+    if which not in cache:
+        cache[which] = {qd['quality']['id']: qd.get('maxSize')
+                        for qd in ac.arr_get(which, '/qualitydefinition')}
+    return cache[which]
+
+
+def _candidate_key(rel, ranks, limits, runtime_min):
     """Sorteersleutel voor een acceptabele release, of None als afgekeurd.
     Volgorde: ladder-rang (profielkwaliteit), dan CF-score, dan seeders."""
     title = rel.get('title') or ''
@@ -420,15 +433,19 @@ def _candidate_key(rel, ranks):
     qid = ((rel.get('quality') or {}).get('quality') or {}).get('id')
     if qid not in ranks:
         return None
+    max_mb_per_min = limits.get(qid)
+    if max_mb_per_min and rel.get('size'):
+        if rel['size'] > max_mb_per_min * runtime_min * 1024 * 1024:
+            return None
     return (ranks[qid], rel.get('customFormatScore', 0), rel.get('seeders') or 0)
 
 
-def _best_release(releases, ranks, full_season=None):
+def _best_release(releases, ranks, limits, runtime_min, full_season=None):
     best, best_key = None, None
     for rel in releases:
         if full_season is not None and bool(rel.get('fullSeason')) != full_season:
             continue
-        key = _candidate_key(rel, ranks)
+        key = _candidate_key(rel, ranks, limits, runtime_min)
         if key is not None and (best_key is None or key > best_key):
             best, best_key = rel, key
     return best
@@ -438,10 +455,10 @@ def _grab(which, rel):
     ac.arr_post(which, '/release', {'guid': rel['guid'], 'indexerId': rel['indexerId']})
 
 
-def _replace_movie(movie, ranks, dry_run):
+def _replace_movie(movie, ranks, limits, dry_run):
     """Return True als (dry-run: zou) vervangen."""
     releases = _release_search('radarr', movieId=movie['id'])
-    best = _best_release(releases, ranks)
+    best = _best_release(releases, ranks, limits, movie.get('runtime') or 45)
     if best is None:
         log.info(f'  geen non-DV kandidaat voor {movie["title"]} ({len(releases)} releases bekeken)')
         return False
@@ -457,16 +474,18 @@ def _replace_movie(movie, ranks, dry_run):
     return True
 
 
-def _replace_season(entry, ranks, dry_run):
+def _replace_season(entry, ranks, limits, dry_run):
     """Vervang de DV-afleveringen van een seizoen. Season pack alleen als het
     hele seizoen DV is; anders per aflevering. Return True als iets vervangen."""
     series, season = entry['series'], entry['season']
     title = f'{series["title"]} S{season:02d}'
+    ep_runtime = series.get('runtime') or 45
     releases = _release_search('sonarr', seriesId=series['id'], seasonNumber=season)
 
     all_dv = entry['total_files'] and len(entry['dv_file_ids']) >= entry['total_files']
     if all_dv:
-        pack = _best_release(releases, ranks, full_season=True)
+        pack = _best_release(releases, ranks, limits,
+                             ep_runtime * entry['total_files'], full_season=True)
         if pack is not None:
             qname = pack['quality']['quality']['name']
             log.info(f'  kandidaat (season pack) voor {title}: {pack.get("title")} '
@@ -492,7 +511,7 @@ def _replace_season(entry, ranks, dry_run):
         candidates = [r for r in releases
                       if not r.get('fullSeason')
                       and (r.get('episodeNumbers') or r.get('mappedEpisodeNumbers') or []) == [epnum]]
-        best = _best_release(candidates, ranks)
+        best = _best_release(candidates, ranks, limits, ep_runtime)
         if best is None:
             log.info(f'  geen non-DV kandidaat voor {title}E{epnum:02d}')
             continue
@@ -515,7 +534,7 @@ def replace_engine(state, det_movies, det_seasons, dry_run):
     """Motor-dag: probeer geparkeerde items te vervangen, max DV_REPLACE_CAP
     pogingen per run (interactieve searches zijn duur voor de indexers)."""
     budget = DV_REPLACE_CAP
-    ladder_cache = {}
+    ladder_cache, limits_cache = {}, {}
     log.info(f'Vervang-motor gestart (cap {DV_REPLACE_CAP}, dry_run={dry_run})')
 
     for key, entry in sorted(state['movies'].items()):
@@ -530,7 +549,8 @@ def replace_engine(state, det_movies, det_seasons, dry_run):
         entry['last_attempt'] = _now()
         try:
             ranks = _profile_ladder('radarr', movie['qualityProfileId'], ladder_cache)
-            if _replace_movie(movie, ranks, dry_run) and not dry_run:
+            limits = _size_limits('radarr', limits_cache)
+            if _replace_movie(movie, ranks, limits, dry_run) and not dry_run:
                 state['replaced']['movies'][key] = _now()
         except Exception as e:
             log.error(f'  vervangen mislukt voor movie {key}: {e}')
@@ -547,7 +567,8 @@ def replace_engine(state, det_movies, det_seasons, dry_run):
         entry['last_attempt'] = _now()
         try:
             ranks = _profile_ladder('sonarr', det['series']['qualityProfileId'], ladder_cache)
-            if _replace_season(det, ranks, dry_run) and not dry_run:
+            limits = _size_limits('sonarr', limits_cache)
+            if _replace_season(det, ranks, limits, dry_run) and not dry_run:
                 state['replaced']['seasons'][key] = _now()
         except Exception as e:
             log.error(f'  vervangen mislukt voor seizoen {key}: {e}')

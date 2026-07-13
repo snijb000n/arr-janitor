@@ -100,8 +100,11 @@ bestaat blijven anders eeuwig staan. Daarom (state in
    geparkeerde items, max `DV_REPLACE_CAP` (15) pogingen per run:
    interactieve indexer-search → beste non-DV release volgens de
    **kwaliteitsladder van het eigen quality profile** (profielvolgorde
-   hoog→laag: eerst WEB-2160p, desnoods 1080p, dan 720p) → pas als er een
-   kandidaat is wordt de oude file verwijderd en die release gegrabt.
+   hoog→laag: eerst WEB-2160p, desnoods 1080p, dan 720p) én binnen de
+   **size-limieten van de quality definitions** (de grab via `POST /release`
+   omzeilt de native size-check van Radarr/Sonarr, dus de motor dwingt
+   dezelfde limieten zelf af) → pas als er een kandidaat is wordt de oude
+   file verwijderd en die release gegrabt.
    Mislukt de download alsnog, dan staat het item op 'missing' en zoekt
    Radarr/Sonarr/huntarr native verder (zonder bestaand bestand geldt de
    downgrade-blokkade niet meer). Niets gevonden → geparkeerd tot de
@@ -122,6 +125,27 @@ toegestane release grabben via de profiel-ladder — DV/3D blijft geblokt
 door de custom formats. De loop-preventie blijft: een item dat na
 vervanging opnieuw DV blijkt wordt níét nogmaals verwijderd maar geparkeerd
 (markers verlopen na 90 dagen). Default `false`.
+
+### quality limits (`quality_limits.py`)
+
+Zet de Sonarr **quality definitions** (size-limieten in MB per minuut
+runtime) op vaste waarden, zodat afleveringen niet onbeperkt groot worden —
+met de ruime defaults mocht een lange aflevering (60–80 min) in 2160p tot
+~9–11 GB zijn. Nieuwe limieten (max, per 45 min): 720p ~1,3 GB, 1080p
+~2,0 GB, 2160p ~3,0 GB. Remux- en SD-kwaliteiten en `minSize` blijven
+ongemoeid; Radarr (films) bewust ook.
+
+Idempotent, eenmalig draaien per machine:
+
+```bash
+./quality_limits.py --dry-run   # toont oud → nieuw
+./quality_limits.py             # past toe
+```
+
+De vervang-motor van dv-guard leest deze limieten via de API en hanteert ze
+ook bij zijn eigen grabs (zie hierboven). Let op: al lopende downloads in de
+queue worden niet met terugwerkende kracht tegengehouden en bestaande grote
+bestanden blijven staan.
 
 ### anime-detectie
 
